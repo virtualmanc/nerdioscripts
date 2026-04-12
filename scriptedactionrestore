@@ -1,0 +1,65 @@
+# ============================================================
+# Nerdio Scripted Actions - Restore (CustomScript only)
+# ============================================================
+
+$backupFile = "C:\backups\scripted-actions\2026-04-12_12-05\all-scripted-actions.json"
+
+# Load backup
+$actions = Get-Content $backupFile -Raw | ConvertFrom-Json
+
+Write-Host "Loaded $($actions.Count) actions from backup" -ForegroundColor Cyan
+
+# Get existing actions to avoid duplicates
+$existing      = Get-NmeScriptedActions
+$existingNames = $existing | Select-Object -ExpandProperty Name
+
+$restored = 0
+$skipped  = 0
+$failed   = 0
+
+foreach ($action in $actions) {
+
+    # Only restore CustomScript actions
+    if ($action.ExecutionEnvironment -ne "CustomScript") {
+        Write-Host "  Skipping (not CustomScript): $($action.Name)" -ForegroundColor Gray
+        $skipped++
+        continue
+    }
+
+    # Skip if already exists
+    if ($existingNames -contains $action.Name) {
+        Write-Host "  Skipping (already exists): $($action.Name)" -ForegroundColor Yellow
+        $skipped++
+        continue
+    }
+
+    try {
+        # Build request object - ExecutionTimeout excluded for CustomScript
+        $request = New-NmeCreateScriptedActionRequest `
+            -Name                 $action.Name `
+            -Script               $action.Script `
+            -ExecutionMode        $action.ExecutionMode `
+            -ExecutionEnvironment $action.ExecutionEnvironment `
+            -Tags                 $action.Tags `
+            -Description          $action.Description
+
+        # Submit to Nerdio
+        New-NmeScriptedActions -NmeCreateScriptedActionRequest $request
+
+        Write-Host "  Restored: $($action.Name)" -ForegroundColor Green
+        $restored++
+    }
+    catch {
+        Write-Host "  FAILED: $($action.Name) - $($_.Exception.Message)" -ForegroundColor Red
+        $failed++
+    }
+}
+
+# Summary
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host "Restore Summary" -ForegroundColor Cyan
+Write-Host "  Restored : $restored" -ForegroundColor Green
+Write-Host "  Skipped  : $skipped"  -ForegroundColor Yellow
+Write-Host "  Failed   : $failed"   -ForegroundColor Red
+Write-Host "============================================================" -ForegroundColor Cyan
