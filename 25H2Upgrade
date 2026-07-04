@@ -1,0 +1,287 @@
+<#
+.SYNOPSIS
+    Nerdio Shell App - Install script: upgrades this host to Windows 11 25H2.
+
+.DESCRIPTION
+    Downloads install media directly from Azure Blob Storage via SAS URL, rather than relying on
+    $Context.GetAttachedBinary() - simpler to test/debug, and avoids Shell App attachment upload
+    limits for multi-gigabyte Windows setup media.
+
+    Follows Nerdio's documented Shell App pattern: on success the script simply completes; on
+    failure it throws, which Nerdio records as a failed policy assessment.
+
+    Handles two source states:
+      - Host is on 24H2 (build 26100.x)  -> downloads the KB5054156 enablement package (eKB), applies
+                                              it, single restart.
+      - Host is on 23H2 or earlier        -> downloads a ZIP of the full 25H2 setup media, extracts
+                                              it, and runs a full feature update, since 23H2 does not
+                                              share 25H2's servicing branch.
+
+    SECURITY NOTE: the SAS URLs below are credentials - anyone who can read this script can read
+    the blob until the SAS expires. Fine for a quick test; before wider rollout, move these into
+    Nerdio secure variables (SecureVar_-prefixed params) instead of leaving them as plain text here.
+
+    Does not force an immediate reboot - schedules one with an on-screen warning so an active
+    single-session user isn't disconnected mid-task.
+#>
+
+# ---- Configuration - replace with your actual blob SAS URLs ----
+$EkbBlobUrl      = 'https://<account>.blob.core.windows.net/<container>/Windows11.0-KB5054156-x64.msu?<sas-token>'
+$FullMediaZipUrl = 'https://<account>.blob.core.windows.net/<container>/Win11-25H2-Media.zip?<sas-token>'
+
+# DANGEROUS - OFF BY DEFAULT. If $true, a host that fails the TPM/Secure Boot readiness check
+# will have the AllowUpgradesWithUnsupportedTPMOrCPU registry bypass applied and the upgrade will
+# proceed anyway. This puts the machine in an unsupported configuration per Microsoft - it's meant
+# for lab/test VMs only (like one still on Standard security type), never for production hosts.
+# The real fix for production is converting the VM to Trusted Launch with vTPM + Secure Boot.
+$AllowUnsupportedHardwareBypass = $false
+
+$RestartDelaySeconds = 1800   # 30 min warning before forced restart
+$LogPath = "$env:ProgramData\Nerdio\Logs\Win11-25H2-Upgrade.log"
+$MarkerPath = 'HKLM:\SOFTWARE\Nerdio\Win1125H2Upgrade'
+$WorkDir = "$env:SystemDrive\NerdioTemp\Win1125H2"
+
+# This Shell App's version field is locked at 1.0, so detection/install don't use Nerdio's
+# version-matching feature at all - Detect returns a plain boolean. This is just an internal
+# label for our own logging/marker bookkeeping, not anything Nerdio compares against.
+$TargetVersionString = '26200.0.0.0'
+
+New-Item -Path (Split-Path $LogPath) -ItemType Directory -Force | Out-Null
+Start-Transcript -Path $LogPath -Append | Out-Null
+
+function Write-Neil25H2Log {
+    param([string]$Message)
+    Write-Output ("[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message)
+    $Context.Log($Message)
+}
+
+function Get-Neil25H2OsState {
+    $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    [PSCustomObject]@{
+        DisplayVersion = $cv.DisplayVersion
+        CurrentBuild   = [int]$cv.CurrentBuildNumber
+        UBR            = $cv.UBR
+    }
+}
+
+function Test-Neil25H2PendingReboot {
+    $keys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\Auto Update\RebootRequired'
+    )
+    foreach ($k in $keys) { if (Test-Path $k) { return $true } }
+    return $false
+}
+
+function Get-Neil25H2BlobFile {
+    param(
+        [string]$Url,
+        [string]$OutFile,
+        [switch]$UseBits
+    )
+    Write-Neil25H2Log "Downloading $(Split-Path $OutFile -Leaf) ..."
+    New-Item -Path (Split-Path $OutFile) -ItemType Directory -Force | Out-Null
+
+    if ($UseBits) {
+        # BITS is resumable and far more reliable for large files than Invoke-WebRequest.
+        Start-BitsTransfer -Source $Url -Destination $OutFile -ErrorAction Stop
+    }
+    else {
+        Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
+    }
+
+    if (-not (Test-Path $OutFile)) {
+        throw "Download appeared to succeed but $OutFile is missing"
+    }
+    Write-Neil25H2Log "Downloaded $(Split-Path $OutFile -Leaf) ($([math]::Round((Get-Item $OutFile).Length / 1MB, 1)) MB)"
+}
+
+function Test-Neil25H2HardwareReadiness {
+    # Checks the same two gates that cause setup.exe to fail with 0xC1900200 - catching this
+    # before downloading 8GB of media saves a lot of wasted time on hosts that can't pass anyway.
+    # On Azure, both usually trace back to the VM not being configured as Trusted Launch
+    # (SecurityType=TrustedLaunch, vTPM enabled, Secure Boot enabled).
+    $issues = @()
+
+    try {
+        $tpm = Get-Tpm -ErrorAction Stop
+        if (-not $tpm.TpmPresent) {
+            $issues += "TPM not present"
+        }
+        elseif (-not $tpm.TpmReady) {
+            $issues += "TPM present but not ready/enabled"
+        }
+    }
+    catch {
+        $issues += "Unable to query TPM state: $($_.Exception.Message)"
+    }
+
+    try {
+        $secureBoot = Confirm-SecureBootUEFI -ErrorAction Stop
+        if (-not $secureBoot) {
+            $issues += "Secure Boot is not enabled"
+        }
+    }
+    catch {
+        # Confirm-SecureBootUEFI throws outright on non-UEFI (legacy BIOS/Gen1) VMs - that's
+        # itself a hard block, not just an inconclusive check.
+        $issues += "Secure Boot check failed - likely legacy BIOS/Gen1 VM, not UEFI: $($_.Exception.Message)"
+    }
+
+    return $issues
+}
+
+function Set-Neil25H2UnsupportedHardwareBypass {
+    Write-Neil25H2Log "Applying AllowUpgradesWithUnsupportedTPMOrCPU bypass - this host will be in an UNSUPPORTED configuration per Microsoft."
+    New-Item -Path 'HKLM:\SYSTEM\Setup\MoSetup' -Force | Out-Null
+    New-ItemProperty -Path 'HKLM:\SYSTEM\Setup\MoSetup' -Name 'AllowUpgradesWithUnsupportedTPMOrCPU' -PropertyType DWORD -Value 1 -Force | Out-Null
+}
+
+function Invoke-Neil25H2EnablementPackage {
+    Write-Neil25H2Log "Path: eKB (24H2 -> 25H2)"
+
+    if ($EkbBlobUrl -match '<account>|<container>|<sas-token>') {
+        throw "EkbBlobUrl still has placeholder values - update the blob URL before running."
+    }
+
+    $msuPath = Join-Path $WorkDir 'Windows11.0-KB5054156-x64.msu'
+    Get-Neil25H2BlobFile -Url $EkbBlobUrl -OutFile $msuPath
+
+    Write-Neil25H2Log "Applying enablement package: $msuPath"
+    $proc = Start-Process -FilePath 'wusa.exe' `
+        -ArgumentList "`"$msuPath`" /quiet /norestart" `
+        -Wait -PassThru -NoNewWindow
+
+    switch ($proc.ExitCode) {
+        0       { Write-Neil25H2Log "eKB applied successfully."; return $true }
+        3010    { Write-Neil25H2Log "eKB applied successfully, reboot required."; return $true }
+        2359302 { Write-Neil25H2Log "eKB already installed."; return $false }
+        default { throw "wusa.exe exited with unexpected code $($proc.ExitCode)" }
+    }
+}
+
+function Invoke-Neil25H2FullFeatureUpdate {
+    Write-Neil25H2Log "Path: full feature update (23H2 or earlier -> 25H2)"
+
+    $hwIssues = Test-Neil25H2HardwareReadiness
+    if ($hwIssues.Count -gt 0) {
+        if ($AllowUnsupportedHardwareBypass) {
+            Write-Neil25H2Log "Hardware readiness check failed ($($hwIssues -join '; ')), but bypass is enabled - proceeding anyway."
+            Set-Neil25H2UnsupportedHardwareBypass
+        }
+        else {
+            throw "Hardware readiness check failed - setup.exe would hit 0xC1900200: $($hwIssues -join '; '). On Azure this almost always means the VM isn't configured as Trusted Launch (vTPM + Secure Boot). Check the VM's SecurityProfile before re-running, or set `$AllowUnsupportedHardwareBypass = `$true for a deliberate lab-only bypass."
+        }
+    }
+    else {
+        Write-Neil25H2Log "Hardware readiness check passed (TPM ready, Secure Boot enabled)."
+    }
+
+    if ($FullMediaZipUrl -match '<account>|<container>|<sas-token>') {
+        throw "FullMediaZipUrl still has placeholder values - update the blob URL before running."
+    }
+
+    $sysDrive = (Get-Item $env:SystemDrive).Root
+    $free = (Get-PSDrive -Name ($sysDrive.Name.TrimEnd(':\'))).Free
+    if ($free -lt 25GB) {
+        throw "Insufficient free space on $sysDrive (found $([math]::Round($free/1GB,1))GB, need ~25GB free for download + extraction + upgrade)"
+    }
+
+    $zipPath = Join-Path $WorkDir 'Win11-25H2-Media.zip'
+    $extractPath = Join-Path $WorkDir 'Media'
+
+    Get-Neil25H2BlobFile -Url $FullMediaZipUrl -OutFile $zipPath -UseBits
+
+    Write-Neil25H2Log "Extracting media to $extractPath"
+    if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
+    Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+
+    $setupExe = Join-Path $extractPath 'setup.exe'
+    if (-not (Test-Path $setupExe)) {
+        # Handle the case where the zip contains a single subfolder wrapping the real media root.
+        $nested = Get-ChildItem -Path $extractPath -Filter 'setup.exe' -Recurse | Select-Object -First 1
+        if ($nested) { $setupExe = $nested.FullName }
+    }
+    if (-not (Test-Path $setupExe)) {
+        throw "setup.exe not found anywhere under $extractPath - check the zip contents"
+    }
+
+    Write-Neil25H2Log "Launching $setupExe"
+    $argList = @(
+        '/auto upgrade',
+        '/quiet',
+        '/noreboot',
+        '/eula accept',
+        '/DynamicUpdate disable',
+        '/Compat IgnoreWarning',
+        '/ShowOOBE none'
+    ) -join ' '
+
+    $proc = Start-Process -FilePath $setupExe -ArgumentList $argList -Wait -PassThru -NoNewWindow
+
+    if ($proc.ExitCode -eq 0) {
+        Write-Neil25H2Log "Feature update staged successfully, reboot required."
+        # Clean up the multi-GB media now that setup has staged everything it needs internally.
+        Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+        Remove-Item $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+        return $true
+    }
+    else {
+        throw ("setup.exe exited with code {0} (0x{0:X}) - leaving downloaded media in place at $extractPath for troubleshooting" -f $proc.ExitCode)
+    }
+}
+
+function Set-Neil25H2ScheduledRestart {
+    param([int]$DelaySeconds)
+    Write-Neil25H2Log "Scheduling restart in $DelaySeconds seconds."
+    $msg = "This desktop is completing a required Windows update and will restart shortly. Please save your work."
+    & shutdown.exe /r /t $DelaySeconds /c $msg /d p:4:1
+}
+
+# ---- Main ----
+try {
+    Write-Neil25H2Log "=== Windows 11 25H2 upgrade - install script starting ==="
+    Write-Neil25H2Log "Target version (internal label): $TargetVersionString"
+
+    if (Test-Neil25H2PendingReboot) {
+        throw "Pending reboot detected before starting - aborting this run, will retry on next assessment cycle."
+    }
+
+    $os = Get-Neil25H2OsState
+    Write-Neil25H2Log "Current state: DisplayVersion=$($os.DisplayVersion) Build=$($os.CurrentBuild).$($os.UBR)"
+
+    if ($os.CurrentBuild -ge 26200) {
+        Write-Neil25H2Log "Host already reports build 26200+ - nothing to do."
+        if (Test-Path $MarkerPath) { Remove-Item $MarkerPath -Recurse -Force }
+        Stop-Transcript | Out-Null
+        return
+    }
+
+    $restartNeeded = $false
+    if ($os.CurrentBuild -ge 26100) {
+        $restartNeeded = Invoke-Neil25H2EnablementPackage
+    }
+    elseif ($os.CurrentBuild -ge 22621) {
+        $restartNeeded = Invoke-Neil25H2FullFeatureUpdate
+    }
+    else {
+        throw "Unsupported source build $($os.CurrentBuild) - not a supported upgrade path to 25H2 from this script"
+    }
+
+    if ($restartNeeded) {
+        New-Item -Path $MarkerPath -Force | Out-Null
+        Set-ItemProperty -Path $MarkerPath -Name 'ScheduledAtUtc'  -Value (Get-Date).ToUniversalTime().ToString('o')
+        Set-ItemProperty -Path $MarkerPath -Name 'SourceVersion'   -Value $os.DisplayVersion
+        Set-ItemProperty -Path $MarkerPath -Name 'TargetVersion'   -Value $TargetVersionString
+        Write-Neil25H2Log "Upgrade marker written."
+        Set-Neil25H2ScheduledRestart -DelaySeconds $RestartDelaySeconds
+    }
+
+    Write-Neil25H2Log "=== Install script completed ==="
+    Stop-Transcript | Out-Null
+}
+catch {
+    Write-Neil25H2Log "FAILED: $($_.Exception.Message)"
+    Stop-Transcript | Out-Null
+    throw
+}
