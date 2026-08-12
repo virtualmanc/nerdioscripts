@@ -21,27 +21,30 @@ Workflow:
 Requires the Nerdio Manager service principal to have Contributor (or equivalent) rights
 on the target VM and its OS disk.
 
-Uses Nerdio's built-in variables, populated automatically when this runbook runs against a VM:
-  $AzureSubscriptionId
-  $AzureResourceGroupName
-  $AzureVMName
-  $AzureRegionName
+Built-in Nerdio variables are declared in the param block below with
+ParameterSetName = "NME_PARAMETER" so they are hidden in the UI but still populated
+automatically by Nerdio Manager.
 #>
 
-<# Variables:
-{
-  "NewDiskSizeGB": {
-    "Description": "Target OS disk size in GB. Must be larger than the current size (most AVD gallery images ship at 128GB).",
-    "IsRequired": true,
-    "DefaultValue": "256"
-  },
-  "SkipDeallocate": {
-    "Description": "Set to 'true' only if the VM is already deallocated and you want to skip the stop step.",
-    "IsRequired": false,
-    "DefaultValue": "false"
-  }
-}
-#>
+param (
+    [Parameter(Mandatory = $true, HelpMessage = "Target OS disk size in GB. Must be larger than the current size (most AVD gallery images ship at 128GB).")]
+    [int] $NewDiskSizeGB = 256,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Tick only if the VM is already deallocated and you want to skip the stop step.")]
+    [bool] $SkipDeallocate = $false,
+
+    [Parameter(ParameterSetName = "NME_PARAMETER")]
+    [string] $AzureSubscriptionId,
+
+    [Parameter(ParameterSetName = "NME_PARAMETER")]
+    [string] $AzureResourceGroupName,
+
+    [Parameter(ParameterSetName = "NME_PARAMETER")]
+    [string] $AzureVMName,
+
+    [Parameter(ParameterSetName = "NME_PARAMETER")]
+    [string] $AzureRegionName
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -51,24 +54,12 @@ function Write-Log {
     Write-Output "[$timestamp] [$Level] $Message"
 }
 
-##### Required Variables (Nerdio built-ins) #####
-# These are populated automatically by Nerdio Manager when the script runs against a VM.
+##### Validate Nerdio built-ins #####
 if ([string]::IsNullOrEmpty($AzureVMName)) {
     Throw "AzureVMName is not set. This script must be run against a specific VM (via Run now against a host, or attached to a host pool/host)."
 }
 if ([string]::IsNullOrEmpty($AzureResourceGroupName)) {
     Throw "AzureResourceGroupName is not set. This script must be run against a specific VM."
-}
-
-##### Script parameters (set via the Variables block above) #####
-if ([string]::IsNullOrEmpty($NewDiskSizeGB)) {
-    $NewDiskSizeGB = 256
-}
-[int]$NewDiskSizeGB = $NewDiskSizeGB
-
-$skipDeallocateBool = $false
-if ($SkipDeallocate -eq 'true') {
-    $skipDeallocateBool = $true
 }
 
 Write-Log "Target VM: $AzureVMName | Resource Group: $AzureResourceGroupName | Target OS disk size: ${NewDiskSizeGB}GB"
@@ -100,7 +91,7 @@ try {
     $vmStatus = (Get-AzVM -ResourceGroupName $AzureResourceGroupName -Name $AzureVMName -Status).Statuses |
         Where-Object { $_.Code -like 'PowerState*' } | Select-Object -ExpandProperty Code
 
-    if (-not $skipDeallocateBool) {
+    if (-not $SkipDeallocate) {
         if ($vmStatus -ne 'PowerState/deallocated') {
             Write-Log "Current power state: $vmStatus. Deallocating VM before resize..."
             Stop-AzVM -ResourceGroupName $AzureResourceGroupName -Name $AzureVMName -Force | Out-Null
