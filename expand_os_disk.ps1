@@ -1,4 +1,4 @@
-#description: Expands the OS disk on an AVD session host VM and extends the in-guest Windows partition to use the new space.
+#description: Expands the OS disk on an AVD session host VM to 256GB and extends the in-guest Windows partition to use the new space.
 #tags: Nerdio, AVD, Storage, Disk, OSDisk
 
 <#
@@ -8,43 +8,29 @@ This script must be run as an Azure Runbook scripted action targeted at a specif
 (e.g. via Scripted Actions -> Azure runbooks -> Run now, selecting the host(s) to run against,
 or attached to a host pool as a manual "Run script" action). It cannot be run as a Windows
 Script, because resizing the underlying managed disk is an ARM-level operation and requires
-the VM to be deallocated — something that can't be done from inside the guest OS.
+the VM to be deallocated - something that can't be done from inside the guest OS.
+
+Fixed target: this action always resizes the OS disk to 256GB.
+
+No param() block here - Nerdio's runbook wrapper already injects its own param() block ahead
+of this script (AzureVMName, AzureResourceGroupName, AzureSubscriptionId, AzureRegionName, etc
+are already in scope by the time this code runs). A second param() block in this file is not
+valid PowerShell once it's no longer the first statement in the assembled script, so all
+per-VM values are just referenced directly below.
 
 Workflow:
   1. Read the current OS disk size for the target VM.
-  2. Validate the requested NewDiskSizeGB is larger than the current size.
-  3. Deallocate the VM (if not already deallocated).
-  4. Resize the managed OS disk.
+  2. Validate 256GB is larger than the current size.
+  3. Deallocate the VM if it isn't already.
+  4. Resize the managed OS disk to 256GB.
   5. Start the VM.
   6. Extend the in-guest C: partition via Invoke-AzVMRunCommand.
 
 Requires the Nerdio Manager service principal to have Contributor (or equivalent) rights
 on the target VM and its OS disk.
-
-Built-in Nerdio variables are declared in the param block below with
-ParameterSetName = "NME_PARAMETER" so they are hidden in the UI but still populated
-automatically by Nerdio Manager.
 #>
 
-param (
-    [Parameter(Mandatory = $true, HelpMessage = "Target OS disk size in GB. Must be larger than the current size (most AVD gallery images ship at 128GB).")]
-    [int] $NewDiskSizeGB = 256,
-
-    [Parameter(Mandatory = $false, HelpMessage = "Tick only if the VM is already deallocated and you want to skip the stop step.")]
-    [bool] $SkipDeallocate = $false,
-
-    [Parameter(ParameterSetName = "NME_PARAMETER")]
-    [string] $AzureSubscriptionId,
-
-    [Parameter(ParameterSetName = "NME_PARAMETER")]
-    [string] $AzureResourceGroupName,
-
-    [Parameter(ParameterSetName = "NME_PARAMETER")]
-    [string] $AzureVMName,
-
-    [Parameter(ParameterSetName = "NME_PARAMETER")]
-    [string] $AzureRegionName
-)
+$NewDiskSizeGB = 256
 
 $ErrorActionPreference = 'Stop'
 
@@ -54,7 +40,6 @@ function Write-Log {
     Write-Output "[$timestamp] [$Level] $Message"
 }
 
-##### Validate Nerdio built-ins #####
 if ([string]::IsNullOrEmpty($AzureVMName)) {
     Throw "AzureVMName is not set. This script must be run against a specific VM (via Run now against a host, or attached to a host pool/host)."
 }
@@ -64,7 +49,6 @@ if ([string]::IsNullOrEmpty($AzureResourceGroupName)) {
 
 Write-Log "Target VM: $AzureVMName | Resource Group: $AzureResourceGroupName | Target OS disk size: ${NewDiskSizeGB}GB"
 
-# If Nerdio's automation account spans multiple subscriptions, make sure we're pointed at the right one
 if (-not [string]::IsNullOrEmpty($AzureSubscriptionId)) {
     Write-Log "Setting context to subscription $AzureSubscriptionId"
     Set-AzContext -SubscriptionId $AzureSubscriptionId | Out-Null
@@ -87,36 +71,27 @@ try {
         return
     }
 
-    # --- Step 1: Deallocate the VM ---
     $vmStatus = (Get-AzVM -ResourceGroupName $AzureResourceGroupName -Name $AzureVMName -Status).Statuses |
         Where-Object { $_.Code -like 'PowerState*' } | Select-Object -ExpandProperty Code
 
-    if (-not $SkipDeallocate) {
-        if ($vmStatus -ne 'PowerState/deallocated') {
-            Write-Log "Current power state: $vmStatus. Deallocating VM before resize..."
-            Stop-AzVM -ResourceGroupName $AzureResourceGroupName -Name $AzureVMName -Force | Out-Null
-            Write-Log "VM deallocated."
-        }
-        else {
-            Write-Log "VM already deallocated. Skipping stop step."
-        }
+    if ($vmStatus -ne 'PowerState/deallocated') {
+        Write-Log "Current power state: $vmStatus. Deallocating VM before resize..."
+        Stop-AzVM -ResourceGroupName $AzureResourceGroupName -Name $AzureVMName -Force | Out-Null
+        Write-Log "VM deallocated."
     }
     else {
-        Write-Log "SkipDeallocate specified — assuming VM is already deallocated." 'WARN'
+        Write-Log "VM already deallocated. Skipping stop step."
     }
 
-    # --- Step 2: Resize the OS disk ---
     Write-Log "Resizing OS disk '$osDiskName' from ${currentSizeGB}GB to ${NewDiskSizeGB}GB"
     $osDisk.DiskSizeGB = $NewDiskSizeGB
     Update-AzDisk -ResourceGroupName $AzureResourceGroupName -DiskName $osDiskName -Disk $osDisk | Out-Null
     Write-Log "Disk resize submitted successfully."
 
-    # --- Step 3: Start the VM ---
     Write-Log "Starting VM '$AzureVMName'..."
     Start-AzVM -ResourceGroupName $AzureResourceGroupName -Name $AzureVMName | Out-Null
     Write-Log "VM started."
 
-    # --- Step 4: Extend the in-guest partition ---
     $inGuestScript = @'
 $ErrorActionPreference = "Stop"
 $driveLetter = "C"
